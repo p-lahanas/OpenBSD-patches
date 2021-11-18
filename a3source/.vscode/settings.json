@@ -1,0 +1,7 @@
+{
+    "editor.tabSize": 8,
+    "files.eol": "\n",
+    "editor.wordWrap": "off",
+    "editor.rulers": [80,120],
+    "todohighlight.isEnable": true
+}

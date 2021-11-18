@@ -1,0 +1,13 @@
+#!/bin/ksh
+
+###################################################
+#Written By: Peter Lahanas
+#Purpose: Simple build script for COMP3301 assignment
+# 15 Oct 2021
+###################################################
+
+cp ~/comp3301-s4587423/a3source/pfexecve/kern_pfexec.c /usr/src/sys/kern/kern_pfexec.c
+cd /usr/src/sys/arch/amd64/compile/GENERIC.MP/
+make
+sudo make install
+sudo reboot
