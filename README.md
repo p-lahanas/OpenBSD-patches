@@ -1,2 +1,2 @@
-# COMP3301
-Source code for COMP3301
+# OpenBSD Changes
+A university course at uni required working with the OpenBSD kernel and each assignment is contained in this repository. 
