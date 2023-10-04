@@ -1,0 +1,1541 @@
+diff a/lib/libc/Symbols.list b/lib/libc/Symbols.list
+--- a/lib/libc/Symbols.list
++++ b/lib/libc/Symbols.list
+@@ -709,6 +709,9 @@ openlog
+ openlog_r
+ pause
+ pclose
++pfexecve
++pfexecvp
++pfexecvpe
+ popen
+ posix_spawn
+ posix_spawn_file_actions_addclose
+diff a/lib/libc/gen/Makefile.inc b/lib/libc/gen/Makefile.inc
+--- a/lib/libc/gen/Makefile.inc
++++ b/lib/libc/gen/Makefile.inc
+@@ -54,4 +54,5 @@ MAN+=	__tfork_thread.3 alarm.3 auth_subr.3 authenticate.3 basename.3 clock.3 \
+ 	siginterrupt.3 signal.3 \
+ 	sigaddset.3 sigwait.3 sleep.3 statvfs.3 sysconf.3 strtofflags.3 \
+ 	syslog.3 time.3 times.3 timespec_get.3 toascii.3 tolower.3 toupper.3 \
+-	ttyname.3 ualarm.3 uname.3 unvis.3 usleep.3 utime.3 valloc.3 vis.3
++	ttyname.3 ualarm.3 uname.3 unvis.3 usleep.3 utime.3 valloc.3 vis.3 \
++	pfexecvp.3
+diff a/lib/libc/gen/exec.c b/lib/libc/gen/exec.c
+--- a/lib/libc/gen/exec.c
++++ b/lib/libc/gen/exec.c
+@@ -30,6 +30,7 @@
+ 
+ #include <sys/types.h>
+ #include <sys/uio.h>
++#include <sys/pfexec.h>
+ 
+ #include <errno.h>
+ #include <limits.h>
+@@ -143,7 +144,7 @@ execvpe(const char *name, char *const *argv, char *const *envp)
+ 	if (name == NULL || *name == '\0') {
+ 		errno = ENOENT;
+ 		return (-1);
+- 	}
++	}
+ 
+ 	/* If it's an absolute or relative path name, it's easy. */
+ 	if (strchr(name, '/')) {
+@@ -250,3 +251,126 @@ execvp(const char *name, char *const *argv)
+ }
+ DEF_WEAK(execvp);
+ 
++int
++pfexecvpe(const struct pfexecve_opts *opts, const char *name, char *const *argv,
++    char *const *envp)
++{
++	char **memp;
++	int cnt;
++	size_t lp, ln, len;
++	char *p;
++	int eacces = 0;
++	char *bp, *cur, *path, buf[PATH_MAX];
++
++	/*
++	 * Do not allow null name
++	 */
++	if (name == NULL || *name == '\0') {
++		errno = ENOENT;
++		return (-1);
++	}
++
++	/* If it's an absolute or relative path name, it's easy. */
++	if (strchr(name, '/')) {
++		bp = (char *)name;
++		cur = path = NULL;
++		goto retry;
++	}
++	bp = buf;
++
++	/* Get the path we're searching. */
++	if (!(path = getenv("PATH")))
++		path = _PATH_DEFPATH;
++	len = strlen(path) + 1;
++	cur = alloca(len);
++	if (cur == NULL) {
++		errno = ENOMEM;
++		return (-1);
++	}
++	strlcpy(cur, path, len);
++	path = cur;
++	while ((p = strsep(&cur, ":"))) {
++		/*
++		 * It's a SHELL path -- double, leading and trailing colons
++		 * mean the current directory.
++		 */
++		if (!*p) {
++			p = ".";
++			lp = 1;
++		} else
++			lp = strlen(p);
++		ln = strlen(name);
++
++		/*
++		 * If the path is too long complain.  This is a possible
++		 * security issue; given a way to make the path too long
++		 * the user may execute the wrong program.
++		 */
++		if (lp + ln + 2 > sizeof(buf)) {
++			struct iovec iov[3];
++
++			iov[0].iov_base = "execvp: ";
++			iov[0].iov_len = 8;
++			iov[1].iov_base = p;
++			iov[1].iov_len = lp;
++			iov[2].iov_base = ": path too long\n";
++			iov[2].iov_len = 16;
++			(void)writev(STDERR_FILENO, iov, 3);
++			continue;
++		}
++		bcopy(p, buf, lp);
++		buf[lp] = '/';
++		bcopy(name, buf + lp + 1, ln);
++		buf[lp + ln + 1] = '\0';
++
++retry:		(void)pfexecve(opts, bp, argv, envp);
++		switch(errno) {
++		case E2BIG:
++			goto done;
++		case EISDIR:
++		case ELOOP:
++		case ENAMETOOLONG:
++		case ENOENT:
++			break;
++		case ENOEXEC:
++			for (cnt = 0; argv[cnt]; ++cnt)
++				;
++			memp = alloca((cnt + 2) * sizeof(char *));
++			if (memp == NULL)
++				goto done;
++			memp[0] = "sh";
++			memp[1] = bp;
++			bcopy(argv + 1, memp + 2, cnt * sizeof(char *));
++			(void)pfexecve(opts, _PATH_BSHELL, memp, envp);
++			goto done;
++		case ENOMEM:
++			goto done;
++		case ENOTDIR:
++			break;
++		case ETXTBSY:
++			/*
++			 * We used to retry here, but sh(1) doesn't.
++			 */
++			goto done;
++		case EACCES:
++			eacces = 1;
++			break;
++		default:
++			goto done;
++		}
++	}
++	if (eacces)
++		errno = EACCES;
++	else if (!errno)
++		errno = ENOENT;
++done:
++	return (-1);
++}
++DEF_WEAK(pfexecvpe);
++
++int
++pfexecvp(const struct pfexecve_opts *opts, const char *name, char *const *argv)
++{
++    return pfexecvpe(opts, name, argv, environ);
++}
++DEF_WEAK(pfexecvp);
+diff a/lib/libc/gen/pfexecvp.3 b/lib/libc/gen/pfexecvp.3
+new file mode 100644
+--- /dev/null
++++ b/lib/libc/gen/pfexecvp.3
+@@ -0,0 +1,82 @@
++.\" Copyright 2021, the University of Queensland
++.\"
++.\" Redistribution and use in source and binary forms, with or without
++.\" modification, are permitted provided that the following conditions
++.\" are met:
++.\" 1. Redistributions of source code must retain the above copyright
++.\"    notice, this list of conditions and the following disclaimer.
++.\" 2. Redistributions in binary form must reproduce the above copyright
++.\"    notice, this list of conditions and the following disclaimer in the
++.\"    documentation and/or other materials provided with the distribution.
++.\" 3. Neither the name of the University nor the names of its contributors
++.\"    may be used to endorse or promote products derived from this software
++.\"    without specific prior written permission.
++.\"
++.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++.\" SUCH DAMAGE.
++.Dd $Mdocdate: October 1 2021 $
++.Dt PFEXECVP 3
++.Os
++.Sh NAME
++.Nm pfexecvp ,
++.Nm pfexecvpe
++.Nd execute a file with elevated privileges
++.Sh SYNOPSIS
++.In sys/pfexec.h
++.Ft int
++.Fn pfexecvp "const struct pfexecve_opts *opts" "const char *file" "char *const argv[]"
++.Ft int
++.Fn pfexecvpe "const struct pfexecve_opts *opts" "const char *file" "char *const argv[]" "char *const envp[]"
++.Sh DESCRIPTION
++This family of functions request elevated privileges from the system and then
++replace the current process image with a new process image.
++The functions described in this manual page are front-ends for the
++.Xr pfexecve 2
++system call; see that manual page for detailed information
++about the elevation process and replacement of the current process.
++.Pp
++The second argument for these functions is the pathname of a file which
++is to be executed. These functions duplicate the actions of the shell in
++searching for an executable file if the specified file name does not contain
++a slash
++.Pq Sq \&/
++character.
++The search path is the path specified in the environment by
++.Ev PATH
++variable.
++If this variable isn't specified,
++.Dv _PATH_DEFPATH
++from
++.In paths.h
++is used instead, its value being:
++.Pa /usr/bin:/bin:/usr/sbin:/sbin:/usr/X11R6/bin:/usr/local/bin
++.Sh RETURN VALUES
++If any of these functions return, an error has occurred.
++The return value is \-1, and the global variable
++.Va errno
++will be set to indicate the error.
++.Sh ERRORS
++.Fn pfexecvp
++and
++.Fn pfexecvpe
++may fail and set
++.Va errno
++for any of the errors specified for the library functions
++.Xr pfexecve 2
++and
++.Xr malloc 3 .
++.Sh SEE ALSO
++.Xr sh 1 ,
++.Xr pfexecve 2 ,
++.Xr execve 2,
++.Xr execv 3
++.Xr environ 7
+diff a/lib/libc/hidden/sys/pfexec.h b/lib/libc/hidden/sys/pfexec.h
+new file mode 100644
+--- /dev/null
++++ b/lib/libc/hidden/sys/pfexec.h
+@@ -0,0 +1,26 @@
++/*
++ * Copyright 2021, the University of Queensland
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifndef _LIBC_SYS_PFEXEC_H_
++#define _LIBC_SYS_PFEXEC_H_
++
++#include_next <sys/pfexec.h>
++
++PROTO_NORMAL(pfexecve);
++PROTO_NORMAL(pfexecvp);
++PROTO_NORMAL(pfexecvpe);
++
++#endif /* !_LIBC_SYS_PFEXEC_H_ */
+diff a/lib/libc/sys/Makefile.inc b/lib/libc/sys/Makefile.inc
+--- a/lib/libc/sys/Makefile.inc
++++ b/lib/libc/sys/Makefile.inc
+@@ -46,7 +46,7 @@ ASM=	__semctl.o __syscall.o __thrsigdivert.o \
+ 	bind.o chdir.o chflags.o chflagsat.o chmod.o chown.o chroot.o \
+ 	clock_getres.o clock_settime.o \
+ 	dup.o dup2.o dup3.o \
+-	execve.o \
++	execve.o pfexecve.o \
+ 	faccessat.o fchdir.o fchflags.o fchmod.o fchmodat.o fchown.o \
+ 	fchownat.o fhopen.o fhstat.o fhstatfs.o \
+ 	flock.o fpathconf.o fstat.o fstatat.o fstatfs.o \
+@@ -197,4 +197,5 @@ MAN+=	__get_tcb.2 __thrsigdivert.2 __thrsleep.2 _exit.2 accept.2 \
+ 	sigprocmask.2 sigreturn.2 sigsuspend.2 socket.2 \
+ 	socketpair.2 stat.2 statfs.2 swapctl.2 symlink.2 \
+ 	sync.2 sysarch.2 syscall.2 sysctl.2 thrkill.2 truncate.2 \
+-	umask.2 unlink.2 unveil.2 utimes.2 utrace.2 vfork.2 wait.2 write.2
++	umask.2 unlink.2 unveil.2 utimes.2 utrace.2 vfork.2 wait.2 write.2 \
++	pfexecve.2
+diff a/lib/libc/sys/pfexecve.2 b/lib/libc/sys/pfexecve.2
+new file mode 100644
+--- /dev/null
++++ b/lib/libc/sys/pfexecve.2
+@@ -0,0 +1,145 @@
++.\" Copyright 2021, the University of Queensland
++.\"
++.\" Redistribution and use in source and binary forms, with or without
++.\" modification, are permitted provided that the following conditions
++.\" are met:
++.\" 1. Redistributions of source code must retain the above copyright
++.\"    notice, this list of conditions and the following disclaimer.
++.\" 2. Redistributions in binary form must reproduce the above copyright
++.\"    notice, this list of conditions and the following disclaimer in the
++.\"    documentation and/or other materials provided with the distribution.
++.\" 3. Neither the name of the University nor the names of its contributors
++.\"    may be used to endorse or promote products derived from this software
++.\"    without specific prior written permission.
++.\"
++.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++.\" SUCH DAMAGE.
++.Dd $Mdocdate: October 1 2021 $
++.Dt PFEXECVE 2
++.Os
++.Sh NAME
++.Nm pfexecve
++.Nd execute a file with elevated privileges
++.Sh SYNOPSIS
++.In sys/pfexec.h
++.Ft int
++.Fn pfexecve "const struct pfexecve_opts *opts" "const char *path" "char *const argv[]" "char *const envp[]"
++.Sh DESCRIPTION
++.Fn pfexecve
++requests elevated privileges from the system and then transforms the calling
++process into a new process in the same way as
++.Xr execve 2 .
++The new process is constructed from an ordinary file,
++whose name is pointed to by
++.Fa path ,
++called the
++.Em new process file .
++This file is either an executable object file,
++or a file of data for an interpreter.
++.Pp
++Elevation of privilege may be allowed or denied by system policy, which is
++determined by the daemon
++.Xr pfexecd 8 .
++The kernel will provide information about the process calling
++.Fn pfexecve
++to
++.Em pfexecd
++in order to allow it to reach a decision.
++.Pp
++The argument
++.Fa opts
++is a pointer to a
++.Em pfexecve_opts
++structure:
++.Bd -literal -offset indent
++struct pfexecve_opts {
++	uint32_t	 pfo_flags;
++	char		 pfo_user[LOGIN_NAME_MAX];
++};
++.Ed
++.Pp
++The
++.Em pfo_flags
++member of the
++.Em pfexecve_opts
++structure is a bitwise OR combination of any of the flags listed in the
++.Em pfexecve_flags
++enumeration:
++.Bl -tag -width PFEXECVE_NOPROMPT
++.It Li PFEXECVE_NOPROMPT
++Indicates that the call should be treated as non-interactive and no credential
++input from the user on the terminal should be attempted. If elevation would
++require additional credentials, the presence of this flag will cause it to
++fail instead.
++.It Li PFEXECVE_USER
++Indicates that the
++.Em pfo_user
++field contains the username of a valid user on the system, and requests that
++the privileges of this user be granted to the process rather than those of
++.Em root ,
++the default.
++.El
++.Pp
++The argument
++.Fa argv
++is a pointer to a null-terminated array of
++character pointers to NUL-terminated character strings.
++These strings construct the argument list to be made available to the new
++process.
++At least one non-null argument must be present in the array;
++by custom, the first element should be
++the name of the executed program (for example, the last component of
++.Fa path ) .
++.Pp
++The argument
++.Fa envp
++is also a pointer to a null-terminated array of
++character pointers to NUL-terminated strings.
++A pointer to this array is normally stored in the global variable
++.Va environ .
++These strings pass information to the
++new process that is not directly an argument to the command (see
++.Xr environ 7 ) .
++.Pp
++.Sh RETURN VALUES
++As the
++.Fn pfexecve
++function overlays the current process image
++with a new process image the successful call
++has no process to return to.
++If
++.Fn pfexecve
++does return to the calling process an error has occurred; the
++return value will be \-1 and the global variable
++.Va errno
++is set to indicate the error.
++.Sh ERRORS
++.Fn pfexecve
++will fail and return to the calling process if:
++.Bl -tag -width Er
++.It Bq Er EINVAL
++The contents of the given arguments are invalid.
++.It Bq Er EPERM
++Elevation of privilege was denied by policy.
++.It Bq Er ENOTCONN
++A connection to the
++.Xr pfexecd 8
++daemon could not be established in order to evaluate escalation policy.
++.El
++.Pp
++Other errors may be returned as per
++.Xr execve 2 .
++.Sh SEE ALSO
++.Xr execve 2 ,
++.Xr pfexecvp 3 ,
++.Xr pfexecd 8 ,
++.Xr environ 7
+diff a/share/man/man4/tty.4 b/share/man/man4/tty.4
+--- a/share/man/man4/tty.4
++++ b/share/man/man4/tty.4
+@@ -330,6 +330,10 @@ Start output on the terminal (like typing ^Q at the keyboard).
+ .It Dv TIOCSCTTY Fa void
+ Make the terminal the controlling terminal for the process (the process
+ must not currently have a controlling terminal).
++.It Dv TIOCJTTY Fa void
++"Joins" the current process to the session and process group which is currently
++in the foreground of the terminal, making it the new controlling terminal for
++the process. This command can only be used by root.
+ .It Dv TIOCDRAIN Fa void
+ Wait until all output is drained.
+ .It Dv TIOCEXCL Fa void
+diff a/sys/conf/files b/sys/conf/files
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -704,6 +704,7 @@ file kern/kern_resource.c
+ file kern/kern_pledge.c
+ file kern/kern_unveil.c
+ file kern/kern_sched.c
++file kern/kern_pfexec.c
+ file kern/kern_intrmap.c		intrmap
+ file kern/kern_sensors.c
+ file kern/kern_sig.c
+diff a/sys/kern/init_sysent.c b/sys/kern/init_sysent.c
+--- a/sys/kern/init_sysent.c
++++ b/sys/kern/init_sysent.c
+@@ -4,7 +4,7 @@
+  * System call switch table.
+  *
+  * DO NOT EDIT-- this file is automatically generated.
+- * created from;	OpenBSD: syscalls.master,v 1.209 2021/03/18 08:43:38 mvs Exp 
++ * created from;	OpenBSD: syscalls.master,v 1.208 2021/01/18 18:25:51 mvs Exp 
+  */
+ 
+ #include <sys/param.h>
+@@ -751,5 +751,7 @@ struct sysent sysent[] = {
+ 	    sys___set_tcb },			/* 329 = __set_tcb */
+ 	{ 0, 0, SY_NOLOCK | 0,
+ 	    sys___get_tcb },			/* 330 = __get_tcb */
++	{ 4, s(struct sys_pfexecve_args), 0,
++	    sys_pfexecve },			/* 331 = pfexecve */
+ };
+ 
+diff a/sys/kern/syscalls.c b/sys/kern/syscalls.c
+--- a/sys/kern/syscalls.c
++++ b/sys/kern/syscalls.c
+@@ -4,7 +4,7 @@
+  * System call names.
+  *
+  * DO NOT EDIT-- this file is automatically generated.
+- * created from;	OpenBSD: syscalls.master,v 1.209 2021/03/18 08:43:38 mvs Exp 
++ * created from;	OpenBSD: syscalls.master,v 1.208 2021/01/18 18:25:51 mvs Exp 
+  */
+ 
+ char *syscallnames[] = {
+@@ -393,4 +393,5 @@ char *syscallnames[] = {
+ 	"#328 (obsolete __tfork51)",		/* 328 = obsolete __tfork51 */
+ 	"__set_tcb",			/* 329 = __set_tcb */
+ 	"__get_tcb",			/* 330 = __get_tcb */
++	"pfexecve",			/* 331 = pfexecve */
+ };
+diff a/sys/kern/syscalls.master b/sys/kern/syscalls.master
+--- a/sys/kern/syscalls.master
++++ b/sys/kern/syscalls.master
+@@ -566,3 +566,6 @@
+ 328	OBSOL		__tfork51
+ 329	STD NOLOCK	{ void sys___set_tcb(void *tcb); }
+ 330	STD NOLOCK	{ void *sys___get_tcb(void); }
++331	STD		{ int sys_pfexecve(const struct pfexecve_opts *opts, \
++			    const char *path, char * const *argp, \
++			    char * const *envp); }
+diff a/sys/kern/tty.c b/sys/kern/tty.c
+--- a/sys/kern/tty.c
++++ b/sys/kern/tty.c
+@@ -995,6 +995,16 @@ ttioctl(struct tty *tp, u_long cmd, caddr_t data, int flag, struct proc *p)
+ 		pr->ps_session->s_ttyp = tp;
+ 		atomic_setbits_int(&pr->ps_flags, PS_CONTROLT);
+ 		break;
++	case TIOCJTTY:			/* join a tty */
++		if (suser(p))
++			return (EPERM);
++		if (pr->ps_session)
++			SESSRELE(pr->ps_session);
++		SESSHOLD(tp->t_session);
++		pr->ps_session = tp->t_session;
++		enterthispgrp(pr, tp->t_pgrp);
++		atomic_setbits_int(&pr->ps_flags, PS_CONTROLT);
++		break;
+ 	case FIOSETOWN: {		/* set pgrp of tty */
+ 		struct pgrp *pgrp;
+ 		struct process *pr1;
+diff a/sys/sys/pfexec.h b/sys/sys/pfexec.h
+new file mode 100644
+--- /dev/null
++++ b/sys/sys/pfexec.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright 2021, the University of Queensland
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#if !defined(_SYS_PFEXEC_H_)
++#define	_SYS_PFEXEC_H_
++
++#include <sys/types.h>
++#include <sys/syslimits.h>
++
++enum pfexecve_flags {
++	/* don't prompt for pws etc */
++	PFEXECVE_NOPROMPT	= (1 << 0),
++	/* request specific user (not root): pfo_user is valid */
++	PFEXECVE_USER		= (1 << 1),
++
++	PFEXECVE_ALL_FLAGS	= PFEXECVE_NOPROMPT |
++				  PFEXECVE_USER
++};
++
++/* Additonal pfexec-specific options to pfexecve() etc */
++struct pfexecve_opts {
++	uint32_t	 pfo_flags;		/* see enum pfexecve_flags */
++
++	/* valid if PFEXECVE_USER is set */
++	char		 pfo_user[LOGIN_NAME_MAX];
++};
++
++int      pfexecve(const struct pfexecve_opts *, const char *, char *const *,
++            char *const *);
++int	 pfexecvp(const struct pfexecve_opts *, const char *, char *const *);
++int	 pfexecvpe(const struct pfexecve_opts *, const char *, char *const *,
++	    char *const *);
++
++#endif /* !defined(_SYS_PFEXEC_H_) */
+diff a/sys/sys/pfexecvar.h b/sys/sys/pfexecvar.h
+new file mode 100644
+--- /dev/null
++++ b/sys/sys/pfexecvar.h
+@@ -0,0 +1,88 @@
++/*
++ * Copyright 2021, the University of Queensland
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#if !defined(_SYS_PFEXECVAR_H_)
++#define	_SYS_PFEXECVAR_H_
++
++#include <sys/types.h>
++#include <sys/syslimits.h>
++
++/* Path to the socket which pfexecd should listen on for kernel reqs */
++#define	PFEXECD_SOCK	"/var/run/pfexecd.sock"
++
++/* A reference to an argument or env var in one of the *area members */
++struct pfexec_arg {
++	uint32_t		pfa_offset;
++	uint32_t		pfa_len;	/* not including NUL */
++};
++
++/* Request, sent from kernel to pfexecd. */
++struct pfexec_req {
++	/* information about calling process */
++	uint32_t		pfr_pid;
++	uint32_t		pfr_uid;
++	uint32_t		pfr_gid;
++	uint32_t		pfr_ngroups;
++	uint32_t		pfr_groups[NGROUPS_MAX];
++
++	/* extra info provided to the pfexecve() syscall by userland */
++	uint32_t		pfr_req_flags;
++	char			pfr_req_user[LOGIN_NAME_MAX];
++
++	/* exec arguments from userland */
++	char			pfr_path[PATH_MAX];
++	uint32_t		pfr_argc;
++	struct pfexec_arg	pfr_argp[1024];
++	uint32_t		pfr_envc;
++	struct pfexec_arg	pfr_envp[1024];
++	char			pfr_argarea[ARG_MAX];
++	char			pfr_envarea[ARG_MAX];
++};
++
++enum pfexec_resp_flags {
++	PFRESP_UID	= (1<<0),
++	PFRESP_GID	= (1<<1),
++	PFRESP_GROUPS	= (1<<2),
++	PFRESP_CHROOT	= (1<<3),
++	PFRESP_ENV	= (1<<4)
++};
++
++/* Response, sent from pfexecd back to kernel. */
++struct pfexec_resp {
++	uint32_t		pfr_flags;	/* enum pfexec_resp_flags */
++
++	/* The errno to return to userland (if any). Always used. */
++	uint32_t		pfr_errno;
++
++	/*
++	 * Things to change about the target process. Each is valid if the
++	 * matching bit in pfr_flags is set.
++	 */
++	uint32_t		pfr_uid;
++
++	uint32_t		pfr_gid;
++
++	uint32_t		pfr_ngroups;
++	uint32_t		pfr_groups[NGROUPS_MAX];
++
++	char			pfr_chroot[PATH_MAX];
++
++	uint32_t		pfr_envc;
++	struct pfexec_arg	pfr_envp[1024];
++	char			pfr_envarea[ARG_MAX];
++};
++
++#endif /* !defined(_SYS_PFEXECVAR_H_) */
+diff a/sys/sys/syscall.h b/sys/sys/syscall.h
+--- a/sys/sys/syscall.h
++++ b/sys/sys/syscall.h
+@@ -4,7 +4,7 @@
+  * System call numbers.
+  *
+  * DO NOT EDIT-- this file is automatically generated.
+- * created from;	OpenBSD: syscalls.master,v 1.209 2021/03/18 08:43:38 mvs Exp 
++ * created from;	OpenBSD: syscalls.master,v 1.208 2021/01/18 18:25:51 mvs Exp 
+  */
+ 
+ /* syscall: "syscall" ret: "int" args: "int" "..." */
+@@ -705,4 +705,7 @@
+ /* syscall: "__get_tcb" ret: "void *" args: */
+ #define	SYS___get_tcb	330
+ 
+-#define	SYS_MAXSYSCALL	331
++/* syscall: "pfexecve" ret: "int" args: "const struct pfexecve_opts *" "const char *" "char *const *" "char *const *" */
++#define	SYS_pfexecve	331
++
++#define	SYS_MAXSYSCALL	332
+diff a/sys/sys/syscallargs.h b/sys/sys/syscallargs.h
+--- a/sys/sys/syscallargs.h
++++ b/sys/sys/syscallargs.h
+@@ -4,7 +4,7 @@
+  * System call argument lists.
+  *
+  * DO NOT EDIT-- this file is automatically generated.
+- * created from;	OpenBSD: syscalls.master,v 1.209 2021/03/18 08:43:38 mvs Exp 
++ * created from;	OpenBSD: syscalls.master,v 1.208 2021/01/18 18:25:51 mvs Exp 
+  */
+ 
+ #ifdef	syscallarg
+@@ -1109,6 +1109,13 @@ struct sys___set_tcb_args {
+ 	syscallarg(void *) tcb;
+ };
+ 
++struct sys_pfexecve_args {
++	syscallarg(const struct pfexecve_opts *) opts;
++	syscallarg(const char *) path;
++	syscallarg(char *const *) argp;
++	syscallarg(char *const *) envp;
++};
++
+ /*
+  * System call prototypes.
+  */
+@@ -1360,3 +1367,4 @@ int	sys_symlinkat(struct proc *, void *, register_t *);
+ int	sys_unlinkat(struct proc *, void *, register_t *);
+ int	sys___set_tcb(struct proc *, void *, register_t *);
+ int	sys___get_tcb(struct proc *, void *, register_t *);
++int	sys_pfexecve(struct proc *, void *, register_t *);
+diff a/sys/sys/ttycom.h b/sys/sys/ttycom.h
+--- a/sys/sys/ttycom.h
++++ b/sys/sys/ttycom.h
+@@ -122,6 +122,7 @@ struct tstamps {
+ #define	TIOCGSID	_IOR('t', 99, int)	/* get sid of tty */
+ #define	TIOCCONS	_IOW('t', 98, int)	/* become virtual console */
+ #define	TIOCSCTTY	 _IO('t', 97)		/* become controlling tty */
++#define	TIOCJTTY	 _IO('t', 124)		/* join another tty (root) */
+ #define	TIOCEXT		_IOW('t', 96, int)	/* pty: external processing */
+ #define	TIOCSIG		_IOW('t', 95, int)	/* pty: generate signal */
+ #define	TIOCDRAIN	 _IO('t', 94)		/* wait till output drained */
+diff a/usr.bin/pfexec/pfexec.1 b/usr.bin/pfexec/pfexec.1
+new file mode 100644
+--- /dev/null
++++ b/usr.bin/pfexec/pfexec.1
+@@ -0,0 +1,95 @@
++.\" Copyright 2021, the University of Queensland
++.\"
++.\" Redistribution and use in source and binary forms, with or without
++.\" modification, are permitted provided that the following conditions
++.\" are met:
++.\" 1. Redistributions of source code must retain the above copyright
++.\"    notice, this list of conditions and the following disclaimer.
++.\" 2. Redistributions in binary form must reproduce the above copyright
++.\"    notice, this list of conditions and the following disclaimer in the
++.\"    documentation and/or other materials provided with the distribution.
++.\" 3. Neither the name of the University nor the names of its contributors
++.\"    may be used to endorse or promote products derived from this software
++.\"    without specific prior written permission.
++.\"
++.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++.\" SUCH DAMAGE.
++.Dd $Mdocdate: October 1 2021 $
++.Dt PFEXEC 1
++.Os
++.Sh NAME
++.Nm pfexec
++.Nd execute commands with elevated privileges
++.Sh SYNOPSIS
++.Nm pfexec
++.Op Fl ns
++.Op Fl u Ar user
++.Ar command
++.Op Ar args
++.Sh DESCRIPTION
++The
++.Nm
++utility executes commands with elevated privileges (as root or another user).
++The
++.Ar command
++argument is mandatory unless
++.Fl s
++is specified.
++.Pp
++The user may be required to authenticate by entering their password on the
++controlling terminal, depending on policy configuration.
++.Pp
++The daemon
++.Xr pfexecd 8
++manages policy for the system based on its configuration files. The
++.Nm
++utility requires
++.Xr pfexecd 8
++to be running in order for it to operate.
++.Pp
++The options are as follows:
++.Bl -tag -width tenletters
++.It Fl n
++Non interactive mode, fail if the matching rule doesn't have the
++.Ic nopass
++option.
++.It Fl s
++Execute the shell from
++.Ev SHELL
++or
++.Pa /etc/passwd .
++.It Fl u Ar user
++Execute the command as
++.Ar user .
++The default is root.
++.El
++.El
++.Sh EXIT STATUS
++.Ex -std pfexec
++It may fail for one of the following reasons:
++.Pp
++.Bl -bullet -compact
++.It
++The
++.Xr pfexecd 8
++policy daemon is not running.
++.It
++The user attempted to run a command which is not permitted.
++.It
++The password was incorrect.
++.It
++The specified command was not found or is not executable.
++.El
++.Sh SEE ALSO
++.Xr pfexecd 8 ,
++.Xr pfexecd.conf 5 ,
++.Xr doas 1
+diff a/usr.sbin/pfexecd/Makefile b/usr.sbin/pfexecd/Makefile
+new file mode 100644
+--- /dev/null
++++ b/usr.sbin/pfexecd/Makefile
+@@ -0,0 +1,7 @@
++PROG=	pfexecd
++SRCS=	pfexecd.c
++MAN=	pfexecd.8 pfexecd.conf.5
++
++LDADD=	-levent
++
++.include <bsd.prog.mk>
+diff a/usr.sbin/pfexecd/pfexecd.8 b/usr.sbin/pfexecd/pfexecd.8
+new file mode 100644
+--- /dev/null
++++ b/usr.sbin/pfexecd/pfexecd.8
+@@ -0,0 +1,80 @@
++.\" Copyright 2021, the University of Queensland
++.\"
++.\" Redistribution and use in source and binary forms, with or without
++.\" modification, are permitted provided that the following conditions
++.\" are met:
++.\" 1. Redistributions of source code must retain the above copyright
++.\"    notice, this list of conditions and the following disclaimer.
++.\" 2. Redistributions in binary form must reproduce the above copyright
++.\"    notice, this list of conditions and the following disclaimer in the
++.\"    documentation and/or other materials provided with the distribution.
++.\" 3. Neither the name of the University nor the names of its contributors
++.\"    may be used to endorse or promote products derived from this software
++.\"    without specific prior written permission.
++.\"
++.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++.\" SUCH DAMAGE.
++.Dd $Mdocdate: October 1 2021 $
++.Dt PFEXECD 8
++.Os
++.Sh NAME
++.Nm pfexecd
++.Nd pfexec policy daemon
++.Sh SYNOPSIS
++.Nm pfexecd
++.Op Fl ft
++.Op Fl c Ar file
++.Sh DESCRIPTION
++.Nm
++is a daemon which makes policy decisions about whether to allow privilege
++escalation by users of the
++.Xr pfexec 1
++tool and the
++.Xr pfexecve 2
++system call.
++.Pp
++Its main purpose is to listen for requests from the kernel, which contain
++credential information about the process and user requesting escalation, and
++then apply the policy specified in its configuration file,
++.Xr pfexecd.conf 5 .
++.Pp
++When escalation is allowed by policy,
++.Nm
++informs the kernel of the final credentials to set for the process, including
++the
++.Em UID ,
++.Em GID ,
++.Em groups ,
++and
++.Em environment variables
++that the new process should run with.
++.Pp
++When escalation is denied,
++.Nm
++specifies the
++.Xr errno 2
++error code value to be returned by
++.Xr pfexecve 2 .
++.Sh FILES
++.Bl -tag -width "/var/run/pfexecd.sock" -compact
++.It Pa /etc/pfexecd.conf
++Default configuration file.
++.It Pa /var/run/pfexecd.sock
++.Ux Ns -domain
++socket used for communication with the kernel via
++.Xr pfexecve 2 .
++.El
++.Sh SEE ALSO
++.Xr pfexec 1 ,
++.Xr pfexecve 2 ,
++.Xr pfexecd.conf 5 ,
++.Xr doas 1
+diff a/usr.sbin/pfexecd/pfexecd.c b/usr.sbin/pfexecd/pfexecd.c
+new file mode 100644
+--- /dev/null
++++ b/usr.sbin/pfexecd/pfexecd.c
+@@ -0,0 +1,423 @@
++/*
++ * Copyright 2021, the University of Queensland
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <unistd.h>
++#include <errno.h>
++#include <signal.h>
++#include <err.h>
++#include <syslog.h>
++#include <fcntl.h>
++#include <string.h>
++
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/cdefs.h>
++#include <sys/time.h>
++#include <sys/queue.h>
++#include <sys/tree.h>
++#include <sys/un.h>
++#include <sys/pfexec.h>
++#include <sys/pfexecvar.h>
++
++#include <event.h>
++
++const off_t CONFIG_MAX_SIZE	= 16777216LL;	/* 16 MB */
++const size_t BACKLOG		= 8;
++
++struct client {
++	TAILQ_ENTRY(client)		 c_entry;
++	struct sockaddr_storage		 c_raddr;
++	int				 c_fd;
++	struct event			 c_readable;
++	struct pfexec_req		 c_req;
++	struct pfexec_resp		 c_resp;
++};
++
++static struct event			 pfd_acceptable;
++static TAILQ_HEAD(clhead, client)	 pfd_clients;
++static char				*pfd_configbuf;
++
++static void	on_lsock_acceptable(int, short, void *);
++static void	on_client_readable(int, short, void *);
++static int	process_request(const struct pfexec_req *,
++    struct pfexec_resp *);
++static void	log_request(const struct pfexec_req *,
++    const struct pfexec_resp *);
++
++void __dead
++usage(const char *arg0)
++{
++	fprintf(stderr, "Usage: %s [-f] [-c file]\n", arg0);
++	fprintf(stderr, "       %s [-c file] -t\n", arg0);
++	fprintf(stderr, "\nOptions:\n");
++	fprintf(stderr, "  -f            Foreground operation: do not fork or "
++	    "daemonise\n");
++	fprintf(stderr, "  -c <file>     Use <file> as configuration file "
++	    "instead of /etc/pfexecd.conf\n");
++	fprintf(stderr, "  -t            Test configuration file: check "
++	    "syntax and exit 0 if ok\n");
++	exit(1);
++}
++
++int
++main(int argc, char *argv[])
++{
++	const char *optstring = "fc:t";
++	const char *conf = "/etc/pfexecd.conf";
++	int daemon = 1, testmode = 0;
++	pid_t kid;
++	int c;
++	int rc, fd, lsock;
++	size_t conflen;
++	struct stat stat;
++	ssize_t done;
++	struct sockaddr_un laddr;
++
++	TAILQ_INIT(&pfd_clients);
++
++	while ((c = getopt(argc, argv, optstring)) != -1) {
++		switch (c) {
++		case 'f':
++			daemon = 0;
++			break;
++		case 't':
++			testmode = 1;
++			break;
++		case 'c':
++			conf = optarg;
++			break;
++		default:
++			warnx("invalid argument");
++			usage(argv[0]);
++		}
++	}
++
++	fd = open(conf, O_RDONLY);
++	if (fd < 0)
++		err(1, "open(%s)", conf);
++	rc = fstat(fd, &stat);
++	if (rc < 0)
++		err(1, "fstat(%s)", conf);
++	if ((stat.st_mode & S_IFREG) == 0)
++		errx(1, "config file %s is not a regular file", conf);
++	if (stat.st_size > CONFIG_MAX_SIZE)
++		errx(1, "config file %s is too big to be pfexecd.conf", conf);
++	conflen = stat.st_size + 1;
++	pfd_configbuf = calloc(1, conflen);
++	if (pfd_configbuf == NULL)
++		err(1, "malloc");
++
++	for (done = 0; done < stat.st_size;) {
++		ssize_t rr;
++		rr = read(fd, pfd_configbuf + done, conflen - done);
++		if (rr < 0)
++			err(1, "read(%s)", conf);
++		if (rr == 0)
++			break;
++		done += rr;
++	}
++	pfd_configbuf[conflen - 1] = '\0';
++	close(fd);
++
++	/*
++	 * Open the pfexecd listening socket which the kernel will connect
++	 * to. We unlink() any old socket file which exists before calling
++	 * bind() (it would be nicer to have a pid file and check it first)
++	 */
++	if (!testmode) {
++		lsock = socket(AF_UNIX, SOCK_SEQPACKET, 0);
++		if (lsock < 0)
++			err(1, "socket");
++
++		bzero(&laddr, sizeof(laddr));
++		laddr.sun_len = sizeof(laddr);
++		laddr.sun_family = AF_UNIX;
++		strlcpy(laddr.sun_path, PFEXECD_SOCK, sizeof(laddr.sun_path));
++
++		unlink(PFEXECD_SOCK);
++		if (bind(lsock, (struct sockaddr *)&laddr, sizeof(laddr)))
++			err(1, "bind(%s)", PFEXECD_SOCK);
++		if (listen(lsock, BACKLOG))
++			err(1, "listen(%s)", PFEXECD_SOCK);
++	}
++
++	if (daemon && !testmode) {
++		kid = fork();
++		if (kid < 0) {
++			err(1, "fork");
++		} else if (kid > 0) {
++			/* The parent process exits immediately. */
++			return (0);
++		}
++		umask(0);
++		if (setsid() < 0) {
++			syslog(LOG_AUTHPRIV | LOG_NOTICE,
++			    "setsid failed: %d (%s)", errno, strerror(errno));
++			exit(1);
++		}
++		chdir("/");
++
++		close(STDIN_FILENO);
++		close(STDOUT_FILENO);
++		close(STDERR_FILENO);
++	}
++
++	/* TODO: drop privileges here */
++
++	/* TODO: parse configuration file here: do it *after* dropping privs */
++
++	/* If we're in config test mode and config parsing was ok, exit now. */
++	if (testmode)
++		return (0);
++
++	/*
++	 * Ignore SIGPIPE if we get it from any of our sockets: we'll poll
++	 * them for read/hup/err later and figure it out anyway.
++	 */
++	signal(SIGPIPE, SIG_IGN);
++
++	event_init();
++	event_set(&pfd_acceptable, lsock, EV_READ, on_lsock_acceptable, NULL);
++	event_add(&pfd_acceptable, NULL);
++
++	event_dispatch();
++
++	free(pfd_configbuf);
++	close(lsock);
++
++	return (0);
++}
++
++static void
++destroy_client(struct client *client)
++{
++	TAILQ_REMOVE(&pfd_clients, client, c_entry);
++	event_del(&client->c_readable);
++	close(client->c_fd);
++	free(client);
++}
++
++static void
++on_lsock_acceptable(int lsock, short evt, void *arg)
++{
++	struct sockaddr_storage raddr;
++	socklen_t slen;
++	int newfd, rc;
++	struct client *client;
++	uid_t uid;
++	gid_t gid;
++
++	slen = sizeof(raddr);
++	newfd = accept(lsock, (struct sockaddr *)&raddr, &slen);
++	if (newfd < 0) {
++		switch (errno) {
++		case ECONNABORTED:
++		case ECONNRESET:
++			goto out;
++		default:
++			syslog(LOG_AUTHPRIV | LOG_NOTICE, "failed to accept "
++			    "connection, aborting: %d (%s)", errno,
++			    strerror(errno));
++			exit(1);
++		}
++	}
++
++	/* Check that the process connecting to us is running as "root". */
++	rc = getpeereid(newfd, &uid, &gid);
++	if (rc != 0) {
++		syslog(LOG_AUTHPRIV | LOG_NOTICE, "failed to retrieve peer "
++		    "uid/gid for new connection, closing");
++		close(newfd);
++		goto out;
++	}
++	if (uid != 0 || gid != 0) {
++		syslog(LOG_AUTHPRIV | LOG_NOTICE, "rejecting connection "
++		    "from non-root user: uid %d, gid %d", uid, gid);
++		close(newfd);
++		goto out;
++	}
++
++	/*
++	 * Set the socket's send buffer size now to make sure there's enough
++	 * memory for it.
++	 */
++	slen = sizeof(struct pfexec_resp) + 32;
++	rc = setsockopt(newfd, SOL_SOCKET, SO_SNDBUF, &slen, sizeof(slen));
++	if (rc < 0) {
++		syslog(LOG_AUTHPRIV | LOG_NOTICE, "failed to set send buffer "
++		    "size for new client, closing");
++		close(newfd);
++		goto out;
++	}
++
++	client = calloc(1, sizeof (*client));
++	if (client == NULL) {
++		syslog(LOG_AUTHPRIV | LOG_NOTICE, "failed to allocate memory "
++		    "for new client, closing");
++		close(newfd);
++		goto out;
++	}
++
++	client->c_fd = newfd;
++	bcopy(&raddr, &client->c_raddr, sizeof(raddr));
++
++	TAILQ_INSERT_TAIL(&pfd_clients, client, c_entry);
++
++	event_set(&client->c_readable, newfd, EV_READ, on_client_readable,
++	    client);
++	event_add(&client->c_readable, NULL);
++
++out:
++	event_add(&pfd_acceptable, NULL);
++}
++
++static void
++on_client_readable(int sock, short evt, void *arg)
++{
++	struct client *client = (struct client *)arg;
++	struct msghdr hdr;
++	struct iovec iov;
++	ssize_t recvd;
++	int rc;
++
++	bzero(&hdr, sizeof(hdr));
++	bzero(&iov, sizeof(iov));
++	hdr.msg_iovlen = 1;
++	hdr.msg_iov = &iov;
++	iov.iov_base = &client->c_req;
++	iov.iov_len = sizeof(struct pfexec_req);
++
++	recvd = recvmsg(sock, &hdr, MSG_DONTWAIT);
++	if (recvd < 0) {
++		if (errno == EAGAIN)
++			goto out;
++		syslog(LOG_AUTHPRIV | LOG_NOTICE, "failed to read request "
++		    "from client, closing");
++		destroy_client(client);
++		return;
++	}
++	if (recvd == 0) {
++		/* EOF: the other end has closed the connection */
++		destroy_client(client);
++		return;
++	}
++	if (recvd < sizeof(struct pfexec_req)) {
++		syslog(LOG_AUTHPRIV | LOG_NOTICE, "short request from client, "
++		    "closing");
++		destroy_client(client);
++		return;
++	}
++
++	bzero(&client->c_resp, sizeof(struct pfexec_resp));
++	rc = process_request(&client->c_req, &client->c_resp);
++	if (rc != 0) {
++		bzero(&client->c_resp, sizeof(struct pfexec_resp));
++		client->c_resp.pfr_errno = rc;
++	}
++	log_request(&client->c_req, &client->c_resp);
++
++	bzero(&hdr, sizeof(hdr));
++	bzero(&iov, sizeof(iov));
++	hdr.msg_iovlen = 1;
++	hdr.msg_iov = &iov;
++	iov.iov_base = &client->c_resp;
++	iov.iov_len = sizeof(struct pfexec_resp);
++	recvd = sendmsg(sock, &hdr, MSG_EOR);
++	if (recvd < 0) {
++		syslog(LOG_AUTHPRIV | LOG_NOTICE, "failed to write to client, "
++		    "closing");
++		destroy_client(client);
++		return;
++	}
++
++out:
++	event_add(&client->c_readable, NULL);
++}
++
++static int
++process_request(const struct pfexec_req *req, struct pfexec_resp *resp)
++{
++	uint i;
++
++	/* Check for correctly formed request. */
++	if (req->pfr_ngroups >= NGROUPS_MAX)
++		return (EINVAL);
++	if (req->pfr_req_flags & ~PFEXECVE_ALL_FLAGS)
++		return (EINVAL);
++	if (strlen(req->pfr_path) < 1 ||
++	    strlen(req->pfr_path) >= PATH_MAX)
++		return (EINVAL);
++	if (req->pfr_argc >= 1024 || req->pfr_envc >= 1024)
++		return (EINVAL);
++	if ((req->pfr_req_flags & PFEXECVE_USER) && (
++	    strlen(req->pfr_req_user) < 1 ||
++	    strlen(req->pfr_req_user) >= LOGIN_NAME_MAX))
++		return (EINVAL);
++
++	/*
++	 * Validate all the argument and env var references before we try to
++	 * use any of them.
++	 */
++	for (i = 0; i < req->pfr_argc; ++i) {
++		const struct pfexec_arg *a = &req->pfr_argp[i];
++		if (a->pfa_offset >= ARG_MAX)
++			return (EINVAL);
++		if (a->pfa_len >= ARG_MAX)
++			return (EINVAL);
++		if (a->pfa_offset + a->pfa_len >= ARG_MAX)
++			return (EINVAL);
++	}
++	for (i = 0; i < req->pfr_envc; ++i) {
++		const struct pfexec_arg *a = &req->pfr_envp[i];
++		if (a->pfa_offset >= ARG_MAX)
++			return (EINVAL);
++		if (a->pfa_len >= ARG_MAX)
++			return (EINVAL);
++		if (a->pfa_offset + a->pfa_len >= ARG_MAX)
++			return (EINVAL);
++	}
++
++	/* TODO: determine whether this request should be allowed */
++
++	return (EPERM);
++}
++
++static void
++log_request(const struct pfexec_req *req, const struct pfexec_resp *resp)
++{
++	const char *requser = (req->pfr_req_flags & PFEXECVE_USER) ?
++	    req->pfr_req_user : "root";
++	if (resp->pfr_errno == 0) {
++		syslog(LOG_AUTHPRIV | LOG_INFO,
++		    "uid %d ran command %s as %s (pid %d)",
++		    req->pfr_uid, req->pfr_path, requser, req->pfr_pid);
++		return;
++	}
++	if (resp->pfr_errno == EPERM) {
++		syslog(LOG_AUTHPRIV | LOG_NOTICE,
++		    "denied escalation for pid %d (%s) as %s, run by uid %d",
++		    req->pfr_pid, req->pfr_path, requser, req->pfr_uid);
++		return;
++	}
++	syslog(LOG_AUTHPRIV | LOG_NOTICE,
++	    "error processing esclation request from pid %d, run by uid %d: "
++	    "%d: %s", req->pfr_pid, req->pfr_uid, resp->pfr_errno,
++	    strerror(resp->pfr_errno));
++}
+diff a/usr.sbin/pfexecd/pfexecd.conf.5 b/usr.sbin/pfexecd/pfexecd.conf.5
+new file mode 100644
+--- /dev/null
++++ b/usr.sbin/pfexecd/pfexecd.conf.5
+@@ -0,0 +1,153 @@
++.\" Copyright 2021, the University of Queensland
++.\"
++.\" Redistribution and use in source and binary forms, with or without
++.\" modification, are permitted provided that the following conditions
++.\" are met:
++.\" 1. Redistributions of source code must retain the above copyright
++.\"    notice, this list of conditions and the following disclaimer.
++.\" 2. Redistributions in binary form must reproduce the above copyright
++.\"    notice, this list of conditions and the following disclaimer in the
++.\"    documentation and/or other materials provided with the distribution.
++.\" 3. Neither the name of the University nor the names of its contributors
++.\"    may be used to endorse or promote products derived from this software
++.\"    without specific prior written permission.
++.\"
++.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++.\" SUCH DAMAGE.
++.Dd $Mdocdate: October 1 2021 $
++.Dt PFEXECD.CONF 5
++.Os
++.Sh NAME
++.Nm pfexecd.conf
++.Nd pfexecd configuration file
++.Sh DESCRIPTION
++The
++.Nm
++configuration file contains the policy to be applied by the
++.Xr pfexecd 8
++daemon.
++.Pp
++It consists of a series of rules, in a similar format to
++.Xr doas.conf 5 .
++.Pp
++The rules have the following format:
++.Bd -ragged -offset indent
++.Ic permit Ns | Ns Ic deny
++.Op Ar options
++.Ar identity
++.Op Ic as Ar target
++.Op Ic cmd Ar command Op Ic args No ...
++.Ed
++Rules consist of the following parts:
++.Bl -tag -width 11n
++.It Ic permit Ns | Ns Ic deny
++The action to be taken if this rule matches.
++.It Ar options
++Options are:
++.Bl -tag -width keepenv
++.It Ic nopass
++The user is not required to enter a password.
++.It Ic nolog
++Do not log successful command execution to
++.Xr syslogd 8 .
++.It Ic persist
++After the user successfully authenticates, do not ask for a password
++again for some time.
++.It Ic keepgroups
++Keeps the group ID and group membership of the process calling
++.Xr pfexecve 2
++unchanged. By default, groups will be set to the target user's primary and
++default groups.
++.It Ic setgroups { Ar group Oo Ar group ... Oc Ic }
++Overrides the group memberships of the new process, setting the primary group
++to the first group specified, and additional group membership to the remaining
++space-separated group names.
++.It Ic keepenv
++Environment variables other than those listed in
++.Xr pfexec 1
++are retained when creating the environment for the new process.
++.It Ic setenv { Oo Ar variable ... Oc Oo Ar variable=value ... Oc Ic }
++Keep or set the space-separated specified variables.
++Variables may also be removed with a leading
++.Sq -
++or set using the latter syntax.
++If the first character of
++.Ar value
++is a
++.Ql $
++then the value to be set is taken from the existing environment
++variable of the indicated name.
++This option is processed after the default environment has been created.
++.It Ic chroot { Oo Ar path Oc Ic }
++Changes the root directory (in a similar manner to
++.Xr chroot 2 )
++of the new process to the given path after loading the executable. If no path
++is given, uses
++.Em /var/empty .
++The executable to be run does not have to exist within the chroot path.
++.El
++.It Ar identity
++The username to match.
++Groups may be specified by prepending a colon
++.Pq Sq \&: .
++Numeric IDs are also accepted.
++.It Ic as Ar target
++The target user the running user is allowed to run the command as.
++The default is all users.
++.It Ic cmd Ar command
++The command the user is allowed or denied to run.
++The default is all commands.
++Be advised that it is best to specify absolute paths.
++If a relative path is specified, only a restricted
++.Ev PATH
++will be searched.
++.It Ic args Op Ar argument ...
++Arguments to command.
++The command arguments provided by the user need to match those specified.
++The keyword
++.Ic args
++alone means that command must be run without any arguments.
++.El
++.Pp
++The last matching rule determines the action taken.
++If no rule matches, the action is denied.
++.Pp
++Comments can be put anywhere in the file using a hash mark
++.Pq Sq # ,
++and extend to the end of the current line.
++.Pp
++The following quoting rules apply:
++.Bl -dash
++.It
++The text between a pair of double quotes
++.Pq Sq \&"
++is taken as is.
++.It
++The backslash character
++.Pq Sq \e
++escapes the next character, including new line characters, outside comments;
++as a result, comments may not be extended over multiple lines.
++.It
++If quotes or backslashes are used in a word,
++it is not considered a keyword.
++.El
++.Sh FILES
++.Bl -tag -width /etc/pfexecd.conf -compact
++.It Pa /etc/pfexecd.conf
++.Xr pfexecd 8
++configuration file.
++.El
++.Sh SEE ALSO
++.Xr pfexec 1 ,
++.Xr pfexecd 8 ,
++.Xr doas.conf 5 ,
++.Xr doas 1
